@@ -1,0 +1,295 @@
+#include "common_structs.h"
+#include "vmlinux.h"
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <linux/errno.h>
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+#define FILE_NAME_LEN	32
+#define NAME_MAX 255
+#define F_CHUNK_SIZE (MAX_PERCPU_BUFSIZE >> 1)
+#define MAX_PERCPU_BUFSIZE  (1 << 15) // set by the kernel as an upper bound
+#define MAX_STRING_SIZE     4096      // same as PATH_MAX
+
+
+#ifndef CORE
+    #if LINUX_VERSION_CODE <                                                                       \
+        KERNEL_VERSION(5, 2, 0) // lower values in old kernels (instr lim is 4096)
+        #define MAX_STR_ARR_ELEM      40
+        #define MAX_ARGS_STR_ARR_ELEM 15
+        #define MAX_PATH_PREF_SIZE    64
+        #define MAX_PATH_COMPONENTS   20
+        #define MAX_BIN_CHUNKS        110
+    #else // complexity limit of 1M verified instructions
+        #define MAX_STR_ARR_ELEM      128
+        #define MAX_ARGS_STR_ARR_ELEM 128
+        #define MAX_PATH_PREF_SIZE    128
+        #define MAX_PATH_COMPONENTS   48
+        #define MAX_BIN_CHUNKS        256
+    #endif
+#else                                // CORE
+    #define MAX_STR_ARR_ELEM      40 // TODO: turn this into global variables set w/ libbpfgo
+    #define MAX_ARGS_STR_ARR_ELEM 15
+    #define MAX_PATH_PREF_SIZE    64
+    #define MAX_PATH_COMPONENTS   20
+    #define MAX_BIN_CHUNKS        110
+#endif
+
+#ifndef CORE
+
+    #define GET_FIELD_ADDR(field) &field
+
+    #define READ_KERN(ptr)                                                                         \
+        ({                                                                                         \
+            typeof(ptr) _val;                                                                      \
+            __builtin_memset((void *) &_val, 0, sizeof(_val));                                     \
+            bpf_probe_read((void *) &_val, sizeof(_val), &ptr);                                    \
+            _val;                                                                                  \
+        })
+
+    #define READ_USER(ptr)                                                                         \
+        ({                                                                                         \
+            typeof(ptr) _val;                                                                      \
+            __builtin_memset((void *) &_val, 0, sizeof(_val));                                     \
+            bpf_probe_read_user((void *) &_val, sizeof(_val), &ptr);                               \
+            _val;                                                                                  \
+        })
+
+#else // CORE
+
+    #define GET_FIELD_ADDR(field) __builtin_preserve_access_index(&field)
+
+    #define READ_KERN(ptr)                                                                         \
+        ({                                                                                         \
+            typeof(ptr) _val;                                                                      \
+            __builtin_memset((void *) &_val, 0, sizeof(_val));                                     \
+            bpf_core_read((void *) &_val, sizeof(_val), &ptr);                                     \
+            _val;                                                                                  \
+        })
+
+    #define READ_USER(ptr)                                                                         \
+        ({                                                                                         \
+            typeof(ptr) _val;                                                                      \
+            __builtin_memset((void *) &_val, 0, sizeof(_val));                                     \
+            bpf_core_read_user((void *) &_val, sizeof(_val), &ptr);                                \
+            _val;                                                                                  \
+        })
+#endif
+
+static __always_inline struct qstr get_d_name_from_dentry(struct dentry *dentry)
+{
+    return READ_KERN(dentry->d_name);
+}
+
+enum buf_idx_e
+{
+    SUBMIT_BUF_IDX,
+    STRING_BUF_IDX,
+    FILE_BUF_IDX,
+    MAX_BUFFERS
+};
+
+typedef struct simple_buf {
+    u8 buf[MAX_PERCPU_BUFSIZE];
+} buf_t;
+
+struct file_path {
+    unsigned char path[NAME_MAX];
+};
+
+
+struct callback_ctx {
+    unsigned char *path;
+    bool found;
+};
+
+struct file_open_audit_event {
+    u64 cgroup;
+    u32 pid;
+    int ret;
+    char nodename[NEW_UTS_LEN + 1];
+    char task[TASK_COMM_LEN];
+    char parent_task[TASK_COMM_LEN];
+    unsigned char path[NAME_MAX];
+};
+
+struct fileopen_bouheki_config {
+    u32 mode;
+    u32 target;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u32));
+} fileopen_events SEC(".maps");
+
+BPF_HASH(fileopen_bouheki_config_map, u32, struct fileopen_bouheki_config, 256);
+BPF_HASH(allowed_access_files, u32, struct file_path, 256);
+BPF_HASH(denied_access_files, u32, struct file_path, 256);
+
+static u64 cb_check_path(struct bpf_map *map, u32 *key, struct file_path *map_path, struct callback_ctx *ctx) {
+    bpf_printk("checking ctx->found: %d, path: map_path: %s, ctx_path: %s", ctx->found, map_path->path, ctx->path);
+
+    size_t size = strlen(map_path->path, NAME_MAX);
+    if (strcmp(map_path->path, ctx->path, size) == 0) {
+        ctx->found = 1;
+    }
+
+    return 0;
+}
+
+static __always_inline void *get_path_str(struct path *path)
+{
+    struct path f_path;
+    bpf_probe_read(&f_path, sizeof(struct path), path);
+    char slash = '/';
+    int zero = 0;
+    struct dentry *dentry = f_path.dentry;
+    struct vfsmount *vfsmnt = f_path.mnt;
+    struct mount *mnt_parent_p;
+
+    struct mount *mnt_p = real_mount(vfsmnt);
+    bpf_probe_read(&mnt_parent_p, sizeof(struct mount *), &mnt_p->mnt_parent);
+
+    u32 buf_off = (MAX_PERCPU_BUFSIZE >> 1);
+    struct dentry *mnt_root;
+    struct dentry *d_parent;
+    struct qstr d_name;
+    unsigned int len;
+    unsigned int off;
+    int sz;
+
+    // Get per-cpu string buffer
+    buf_t *string_p = get_buf(STRING_BUF_IDX);
+    if (string_p == NULL)
+        return NULL;
+
+#pragma unroll
+    for (int i = 0; i < MAX_PATH_COMPONENTS; i++) {
+        mnt_root = get_mnt_root_ptr_from_vfsmnt(vfsmnt);
+        d_parent = get_d_parent_ptr_from_dentry(dentry);
+        if (dentry == mnt_root || dentry == d_parent) {
+            if (dentry != mnt_root) {
+                // We reached root, but not mount root - escaped?
+                break;
+            }
+            if (mnt_p != mnt_parent_p) {
+                // We reached root, but not global root - continue with mount point path
+                bpf_probe_read(&dentry, sizeof(struct dentry *), &mnt_p->mnt_mountpoint);
+                bpf_probe_read(&mnt_p, sizeof(struct mount *), &mnt_p->mnt_parent);
+                bpf_probe_read(&mnt_parent_p, sizeof(struct mount *), &mnt_p->mnt_parent);
+                vfsmnt = &mnt_p->mnt;
+                continue;
+            }
+            // Global root - path fully parsed
+            break;
+        }
+        // Add this dentry name to path
+        d_name = get_d_name_from_dentry(dentry);
+        len = (d_name.len + 1) & (MAX_STRING_SIZE - 1);
+        off = buf_off - len;
+
+        // Is string buffer big enough for dentry name?
+        sz = 0;
+        if (off <= buf_off) { // verify no wrap occurred
+            len = len & ((MAX_PERCPU_BUFSIZE >> 1) - 1);
+            sz = bpf_probe_read_str(
+                &(string_p->buf[off & ((MAX_PERCPU_BUFSIZE >> 1) - 1)]), len, (void *) d_name.name);
+        } else
+            break;
+        if (sz > 1) {
+            buf_off -= 1; // remove null byte termination with slash sign
+            bpf_probe_read(&(string_p->buf[buf_off & (MAX_PERCPU_BUFSIZE - 1)]), 1, &slash);
+            buf_off -= sz - 1;
+        } else {
+            // If sz is 0 or 1 we have an error (path can't be null nor an empty string)
+            break;
+        }
+        dentry = d_parent;
+    }
+
+    if (buf_off == (MAX_PERCPU_BUFSIZE >> 1)) {
+        // memfd files have no path in the filesystem -> extract their name
+        buf_off = 0;
+        d_name = get_d_name_from_dentry(dentry);
+        bpf_probe_read_str(&(string_p->buf[0]), MAX_STRING_SIZE, (void *) d_name.name);
+    } else {
+        // Add leading slash
+        buf_off -= 1;
+        bpf_probe_read(&(string_p->buf[buf_off & (MAX_PERCPU_BUFSIZE - 1)]), 1, &slash);
+        // Null terminate the path string
+        bpf_probe_read(&(string_p->buf[(MAX_PERCPU_BUFSIZE >> 1) - 1]), 1, &zero);
+    }
+
+    set_buf_off(STRING_BUF_IDX, buf_off);
+    return &string_p->buf[buf_off];
+}
+
+SEC("lsm/file_open")
+int BPF_PROG(restricted_file_open, struct file *file)
+{
+    struct task_struct *current_task;
+    struct uts_namespace *uts_ns;
+    struct mnt_namespace *mnt_ns;
+    struct nsproxy *nsproxy;
+    struct file *fp;
+    struct dentry *dentry;
+    const __u8 *filename;
+    struct file_open_audit_event event = {};
+    int index = 0;
+    struct fileopen_bouheki_config *config = (struct fileopen_bouheki_config *)bpf_map_lookup_elem(&fileopen_bouheki_config_map, &index);
+    int ret = -1;
+    unsigned int inum;
+
+    current_task = (struct task_struct *)bpf_get_current_task();
+    BPF_CORE_READ_INTO(&nsproxy, current_task, nsproxy);
+    BPF_CORE_READ_INTO(&uts_ns, nsproxy, uts_ns);
+    BPF_CORE_READ_INTO(&event.nodename, uts_ns, name.nodename);
+    BPF_CORE_READ_INTO(&mnt_ns, nsproxy, mnt_ns);
+    BPF_CORE_READ_INTO(&inum, mnt_ns, ns.inum);
+    event.cgroup = bpf_get_current_cgroup_id();
+    event.pid = (u32)(bpf_get_current_pid_tgid() >> 32);
+    bpf_get_current_comm(&event.task, sizeof(event.task));
+    struct task_struct *parent_task = BPF_CORE_READ(current_task, real_parent);
+    bpf_probe_read_kernel_str(&event.parent_task, sizeof(event.parent_task), &parent_task->comm);
+
+    //if (bpf_d_path(&file->f_path, event.path, NAME_MAX) < 0) {
+    //    return 0;
+    //}
+
+    void *path = get_path_str(GET_FIELD_ADDR(file->f_path));
+    //event.path = getfullpath(&file->f_inode,event.path,NAME_MAX);
+
+    struct callback_ctx cb = { .path = path, .found = false};
+    cb.found = false;
+    bpf_for_each_map_elem(&denied_access_files, cb_check_path, &cb, 0);
+    if (cb.found) {
+        bpf_printk("Access Denied: %s\n", cb.path);
+        ret = -EPERM;
+        goto out;
+    }
+
+    bpf_for_each_map_elem(&allowed_access_files, cb_check_path, &cb, 0);
+    if (cb.found) {
+        ret = 0;
+        goto out;
+    }
+
+out:
+    // want to call is_container(), but the stack size is too large to load the BPF program.
+    // We have no choice but to write an equivalent process...
+    if (config && config->target == TARGET_CONTAINER && inum == 0xF0000000) {
+        return 0;
+    }
+
+    if (config && config->mode == MODE_MONITOR) {
+        ret = 0;
+    }
+
+    event.ret = ret;
+    bpf_perf_event_output((void *)ctx, &fileopen_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    return ret;
+}

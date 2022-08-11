@@ -10,6 +10,10 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define FILE_NAME_LEN	32
 #define NAME_MAX 255
 
+#ifndef memset
+# define memset(dest, chr, n)   __builtin_memset((dest), (chr), (n))
+#endif
+
 struct file_path {
     unsigned char path[NAME_MAX];
 };
@@ -29,6 +33,8 @@ struct file_open_audit_event {
     char parent_task[TASK_COMM_LEN];
     unsigned char path[NAME_MAX];
 };
+//unsigned char path1[NAME_MAX]="/etc/passwd";
+unsigned char path1[NAME_MAX];
 
 struct fileopen_bouheki_config {
     u32 mode;
@@ -42,19 +48,19 @@ struct {
 } fileopen_events SEC(".maps");
 
 BPF_HASH(fileopen_bouheki_config_map, u32, struct fileopen_bouheki_config, 256);
-BPF_HASH(allowed_access_files, u32, struct file_path, 256);
-BPF_HASH(denied_access_files, u32, struct file_path, 256);
+BPF_HASH(allowed_access_files, struct file_path, u32, 256);
+BPF_HASH(denied_access_files, struct file_path, u32, 256);
 
-static u64 cb_check_path(struct bpf_map *map, u32 *key, struct file_path *map_path, struct callback_ctx *ctx) {
-    bpf_printk("checking ctx->found: %d, path: map_path: %s, ctx_path: %s", ctx->found, map_path->path, ctx->path);
+//static u64 cb_check_path(struct bpf_map *map, u32 *key, struct file_path *map_path, struct callback_ctx *ctx) {
+//    bpf_printk("checking ctx->found: %d, path: map_path: %s, ctx_path: %s", ctx->found, map_path->path, ctx->path);
 
-    size_t size = strlen(map_path->path, NAME_MAX);
-    if (strcmp(map_path->path, ctx->path, size) == 0) {
-        ctx->found = 1;
-    }
+//    size_t size = strlen(map_path->path, NAME_MAX);
+//    if (strcmp(map_path->path, ctx->path, size) == 0) {
+//        ctx->found = 1;
+//    }
 
-    return 0;
-}
+//    return 0;
+//}
 
 SEC("lsm/file_open")
 int BPF_PROG(restricted_file_open, struct file *file)
@@ -87,21 +93,31 @@ int BPF_PROG(restricted_file_open, struct file *file)
     if (bpf_d_path(&file->f_path, event.path, NAME_MAX) < 0) {
         return 0;
     }
-
-    struct callback_ctx cb = { .path = event.path, .found = false};
-    cb.found = false;
-    bpf_for_each_map_elem(&denied_access_files, cb_check_path, &cb, 0);
-    if (cb.found) {
-        bpf_printk("Access Denied: %s\n", cb.path);
+    int found = 0;
+    memset(&path1, 0 , NAME_MAX);
+    bpf_probe_read_kernel_str(&path1 , NAME_MAX , &event.path);
+    if (bpf_map_lookup_elem(&denied_access_files, &path1)) {
+        found = 1;
+    }
+    //bpf_printk("%s || %d ||| %s",event.path , found , path1);
+    if (found) {
+        bpf_printk("Access Denied: %s\n", event.path);
         ret = -EPERM;
         goto out;
     }
+    //int found1 = 0;
+    ret = 0;
+    //if (bpf_map_lookup_elem(&allowed_access_files, &path1)) {
+    //	found1 = 1;
+    //}
+    //if (found1) {
+    //    bpf_printk("yes!");
+    //    ret = 0;
+    //    goto out;
+    //}
 
-    bpf_for_each_map_elem(&allowed_access_files, cb_check_path, &cb, 0);
-    if (cb.found) {
-        ret = 0;
-        goto out;
-    }
+
+//    bpf_printk("%s , %d",event.path , found);
 
 out:
     // want to call is_container(), but the stack size is too large to load the BPF program.

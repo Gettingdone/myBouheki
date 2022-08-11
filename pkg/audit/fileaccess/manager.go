@@ -88,9 +88,11 @@ func (m *Manager) setAllowedFileAccessMap() error {
 	allowed_paths := m.config.RestrictedFileAccessConfig.Allow
 
 	for i, path := range allowed_paths {
-		key := uint8(i)
-		value := []byte(path)
-		err = map_allowed_files.Update(unsafe.Pointer(&key), unsafe.Pointer(&value[0]))
+		//key := uint8(i)
+		//value := []byte(path)
+		key := []byte(path)
+                value := uint8(i)
+		err = map_allowed_files.Update(unsafe.Pointer(&key[0]), unsafe.Pointer(&value))
 		if err != nil {
 			return err
 		}
@@ -107,11 +109,12 @@ func (m *Manager) setDeniedFileAccessMap() error {
 	denied_paths := m.config.RestrictedFileAccessConfig.Deny
 
 	for i, path := range denied_paths {
-		key := uint8(i)
-		value := []byte(path)
-
-		keyPtr := unsafe.Pointer(&key)
-		valuePtr := unsafe.Pointer(&value[0])
+		//key := uint8(i)
+		//value := []byte(path)
+                key := []byte(path)
+                value := uint8(i)
+		keyPtr := unsafe.Pointer(&key[0])
+		valuePtr := unsafe.Pointer(&value)
 		err = map_denied_files.Update(keyPtr, valuePtr)
 		if err != nil {
 			return err

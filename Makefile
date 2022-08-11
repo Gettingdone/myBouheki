@@ -76,3 +76,9 @@ release/local: build build/docker
 release: build build/docker
 	CGO_CFLAGS="-I$(abspath $(OUTPUT))" CGO_LDFLAGS="-lelf -lz $(LIBBPF_OBJ)" goreleaser release --rm-dist
 	sudo docker push ghcr.io/mrtc0/bouheki:latest
+
+
+.PHONY: clean
+clean:
+	-rm -rf build
+	-rm -rf $(BPF_BUILDDIR)

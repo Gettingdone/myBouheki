@@ -18,10 +18,11 @@ network:
   # Restrictions by command name (optional).
   command:
     # Default: empty. All command will be allowed.
-    allow: []
-    # - curl
+    allow:
+      - curl
     # Default: empty. All command will be allowed.
-    deny: []
+    deny:
+      - ping
     #  - wget
     #  - nc
   # Restrictions by UID (optional).
@@ -35,12 +36,15 @@ network:
     deny: []
       # 1000
 files:
-  mode: monitor
+  mode: block
   target: host
   allow:
     - /
   deny:
+    - /etc/passwd
     - /proc/sysrq-trigger
+    - /home/pmj/111
+    - /etc/passwd1
 mount:
   mode: block
   target: host
